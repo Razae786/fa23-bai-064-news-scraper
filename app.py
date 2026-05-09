@@ -8,6 +8,7 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 app = Flask(__name__)
 
@@ -54,6 +55,9 @@ def get_chrome_driver():
     options.add_argument("--disable-popup-blocking")
     options.add_argument("--ignore-certificate-errors")
     options.add_argument("--allow-running-insecure-content")
+    options.add_argument("--blink-settings=imagesEnabled=false")
+    options.add_argument("--disable-animations")
+    options.page_load_strategy = "eager"
     options.add_argument(
         "user-agent=Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -61,12 +65,11 @@ def get_chrome_driver():
     )
     service = Service("/usr/bin/chromedriver")
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(25)
     return driver
 
 
 def is_valid_article_url(url):
-    """Reject homepage, categories, tags, authors, search pages."""
     if not url:
         return False
     url = url.strip()
@@ -76,7 +79,6 @@ def is_valid_article_url(url):
         return False
     if "/category/" in url or "/topics/" in url:
         return False
-    # Ars Technica articles have /YYYY/MM/ in URL
     if not re.search(r'/20\d\d/', url):
         return False
     return True
@@ -116,14 +118,21 @@ def summarize_text(text, num_sentences=3):
     return " ".join(ordered)
 
 
+def safe_get(driver, url):
+    """Load page with timeout handling. Returns True if we can proceed."""
+    try:
+        driver.get(url)
+        return True
+    except TimeoutException:
+        # Page partially loaded - we can still try to extract content
+        return True
+    except Exception:
+        return False
+
+
 def find_first_article(driver, search_url):
-    """Try multiple selectors to find the first real article link."""
-    wait = WebDriverWait(driver, 20)
+    time.sleep(3)
 
-    # Wait for any article or result to appear
-    time.sleep(4)
-
-    # Strategy 1: Common Ars Technica search/article selectors
     selectors = [
         "article h2 a",
         "article h3 a",
@@ -150,7 +159,6 @@ def find_first_article(driver, search_url):
         except Exception:
             continue
 
-    # Strategy 2: Scan all links as last resort
     links = driver.find_elements(By.TAG_NAME, "a")
     for link in links:
         try:
@@ -170,30 +178,35 @@ def scrape_ars_technica(keyword):
 
     try:
         query = keyword.replace(" ", "+")
-
-        # Try Ars Technica search page first
         search_url = f"https://arstechnica.com/search/?query={query}"
-        driver.get(search_url)
+        
+        if not safe_get(driver, search_url):
+            return "", "Failed to load search page."
 
         article_url = find_first_article(driver, search_url)
 
-        # Fallback: try WordPress search format if first fails
         if not article_url:
             wp_search = f"https://arstechnica.com/?s={query}"
-            driver.get(wp_search)
-            article_url = find_first_article(driver, wp_search)
+            if safe_get(driver, wp_search):
+                article_url = find_first_article(driver, wp_search)
 
         if not article_url:
             return "", "No article found for the given keyword."
 
-        result_url = article_url.strip().strip()
+        result_url = article_url
 
-        # Visit the article
-        driver.get(article_url)
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        time.sleep(2)
+        # Visit article with timeout protection
+        safe_get(driver, article_url)
+        
+        # Wait for body to be present (even if page timed out, body usually exists)
+        try:
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+        except Exception:
+            pass
+        
+        time.sleep(1)
 
         article_text = ""
         content_selectors = [
@@ -221,7 +234,6 @@ def scrape_ars_technica(keyword):
             except Exception:
                 article_text = ""
 
-        # Clean text
         lines = [line.strip() for line in article_text.split("\n")
                  if len(line.strip()) > 25 and not line.strip().startswith("©")]
         article_text = " ".join(lines[:80])
